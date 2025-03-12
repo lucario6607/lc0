@@ -5,10 +5,6 @@ image:
 - Visual Studio 2017
 environment:
   matrix:
-  - NAME: gpu-nvidia-cudnn
-  - NAME: gpu-nvidia-cuda
-  - NAME: gpu-dx12
-  - NAME: gpu-opencl
   - NAME: cpu-dnnl
   - NAME: cpu-openblas
   - NAME: onednn
