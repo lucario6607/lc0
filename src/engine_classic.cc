@@ -25,18 +25,29 @@
   Program grant you additional permission to convey the resulting work.
 */
 
-#include "engine_classic.h"
+#include <chrono>
+#include <future>
+// ... other necessary standard includes ...
 
-#include <algorithm>
-#include <cmath>
-#include <functional>
+// --- Core LC0 Type Definitions FIRST ---
+#include "chess/types.h"           // Defines Value, Move, Eval, GameResult etc.
+#include "search/stats.h"          // Defines IterationStats
+#include "search/search_stopper.h" // Defines SearchStopper, StoppersHints
+#include "proto/net.pb.h"          // Defines EvalResult
 
-#include "neural/shared_params.h"
+// --- Other LC0 System Includes ---
+#include "config.h"
+#include "neural/network.h"
+#include "tree/nodetree.h"
+#include "uci/uciresponder.h"
+// ... any other base system includes needed ...
+
+// --- Engine/Search Specific Includes ---
+// Include the header for the file being implemented
+#include "engine_classic.h" // or #include "engine_loop.h"
+
+// Include search implementation header (contains definitions needed)
 #include "search/classic/search.h"
-#include "search/classic/stoppers/factory.h"
-#include "utils/commandline.h"
-#include "utils/configfile.h"
-#include "utils/logging.h"
 
 namespace lczero {
 namespace {
