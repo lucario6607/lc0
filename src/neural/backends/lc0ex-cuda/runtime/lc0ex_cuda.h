@@ -31,6 +31,8 @@
 #include <absl/container/inlined_vector.h>
 
 #include <cassert>
+#include <cstdint>
+#include <string_view>
 #include <version>
 
 #include "proto/lc0ex.pb.h"
@@ -454,6 +456,13 @@ class CudaProgram {
   std::vector<NodeVariant> nodes_;
   size_t batch_size_;
 };
+
+// Returns the compute-ordering ticket for the next execution when
+// LC0EX_ORDERING=ticket, otherwise 0. Call under the compute ordering lock.
+uint64_t NextOrderingTicket(const CudaEvent& compute_ordering_event);
+// Selects "none", "ticket" or "event" compute ordering for a backend.
+void SetComputeOrdering(const CudaEvent& compute_ordering_event,
+                        std::string_view mode);
 
 class CudaGraphExec {
  public:

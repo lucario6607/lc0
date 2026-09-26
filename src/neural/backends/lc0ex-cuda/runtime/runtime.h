@@ -85,6 +85,7 @@ struct ComputationState {
   typename R::Event mlh_download_done_;
   typename R::Event policy_download_done_;
   size_t total_legal_moves_;
+  uint64_t ordering_ticket_ = 0;
 };
 
 // Handles and descriptor references returned by an Executable remain valid

@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -1043,6 +1044,79 @@ $L__BB0_7:
 	ret;
 
 }
+	// .globl	lc0ex_ordering_wait
+.visible .entry lc0ex_ordering_wait(
+	.param .u64 lc0ex_ordering_wait_param_0,
+	.param .u64 lc0ex_ordering_wait_param_1
+)
+{
+	.reg .pred 	%p<5>;
+	.reg .b32 	%r<3>;
+	.reg .b64 	%rd<11>;
+
+
+	ld.param.u64 	%rd2, [lc0ex_ordering_wait_param_0];
+	ld.param.u64 	%rd3, [lc0ex_ordering_wait_param_1];
+	mov.u32 	%r1, %tid.x;
+	setp.ne.s32 	%p1, %r1, 0;
+	@%p1 bra 	$L__BB1_4;
+
+	// begin inline asm
+	mov.u64 %rd4, %globaltimer;
+	// end inline asm
+	// begin inline asm
+	ld.acquire.gpu.global.u64 %rd5, [%rd2];
+	// end inline asm
+	setp.ge.u64 	%p2, %rd5, %rd3;
+	@%p2 bra 	$L__BB1_4;
+
+$L__BB1_2:
+	// begin inline asm
+	mov.u64 %rd7, %globaltimer;
+	// end inline asm
+	sub.s64 	%rd8, %rd7, %rd4;
+	setp.gt.u64 	%p3, %rd8, 20000000;
+	@%p3 bra 	$L__BB1_4;
+
+	mov.u32 	%r2, 200;
+	// begin inline asm
+	nanosleep.u32 %r2;
+	// end inline asm
+	// begin inline asm
+	ld.acquire.gpu.global.u64 %rd9, [%rd2];
+	// end inline asm
+	setp.lt.u64 	%p4, %rd9, %rd3;
+	@%p4 bra 	$L__BB1_2;
+
+$L__BB1_4:
+	ret;
+
+}
+	// .globl	lc0ex_ordering_signal
+.visible .entry lc0ex_ordering_signal(
+	.param .u64 lc0ex_ordering_signal_param_0,
+	.param .u64 lc0ex_ordering_signal_param_1
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .b32 	%r<2>;
+	.reg .b64 	%rd<5>;
+
+
+	ld.param.u64 	%rd1, [lc0ex_ordering_signal_param_0];
+	ld.param.u64 	%rd2, [lc0ex_ordering_signal_param_1];
+	mov.u32 	%r1, %tid.x;
+	setp.ne.s32 	%p1, %r1, 0;
+	@%p1 bra 	$L__BB2_2;
+
+	cvta.to.global.u64 	%rd3, %rd1;
+	membar.gl;
+	atom.global.max.u64 	%rd4, [%rd3], %rd2;
+
+$L__BB2_2:
+	ret;
+
+}
 
 )LC0EXPTX";
 
@@ -1083,6 +1157,107 @@ CUfunction CopyKernelFunction() {
     cached_context = context;
   }
   return cached;
+}
+
+// Compute ordering between executions (backend option `ordering`).
+// "event" uses CUDA event record/wait nodes.
+// Under WDDM a graph's event wait is only released when the recording graph
+// finishes, so the next batch cannot start during the heads as intended.
+// "ticket" enforces the same order on the device: every execution takes a
+// ticket under the compute ordering lock, waits until the counter reaches the
+// previous ticket and publishes its own ticket where the event was recorded.
+// "none" drops the ordering: consecutive batches overlap on the GPU. That won
+// +1.2 % on a card held at its board power limit, but lost ~10 % once the card
+// was limited by core power instead. "event" is the default; the ticket wait
+// gives up after 20 ms so it can never deadlock.
+enum class OrderingMode { kEvent, kTicket, kNone };
+
+struct OrderingCounter {
+  const CudaEvent* key;
+  CUdeviceptr counter;
+  uint64_t next_ticket;
+  OrderingMode mode;
+};
+
+OrderingCounter& GetOrderingCounter(const CudaEvent& key) {
+  static std::mutex mutex;
+  static std::vector<std::unique_ptr<OrderingCounter>> counters;
+  std::lock_guard<std::mutex> lock(mutex);
+  for (auto& c : counters) {
+    if (c->key == &key) return *c;
+  }
+  CUdeviceptr counter = 0;
+  LC0EX_CUDA_CHECK(cuMemAlloc(&counter, sizeof(uint64_t)));
+  LC0EX_CUDA_CHECK(cuMemsetD8(counter, 0, sizeof(uint64_t)));
+  counters.push_back(std::make_unique<OrderingCounter>(
+      OrderingCounter{&key, counter, 0, OrderingMode::kNone}));
+  return *counters.back();
+}
+
+OrderingMode GetOrderingMode(const CudaEvent& compute_ordering_event) {
+  return GetOrderingCounter(compute_ordering_event).mode;
+}
+
+struct OrderingKernelArguments {
+  CUdeviceptr counter;
+  unsigned long long ticket;
+  std::array<void*, 2> pointers{&counter, &ticket};
+};
+
+CUDA_KERNEL_NODE_PARAMS OrderingKernelParams(bool wait,
+                                             OrderingKernelArguments& args) {
+  static thread_local CUcontext cached_context = nullptr;
+  static thread_local CUfunction wait_function = nullptr;
+  static thread_local CUfunction signal_function = nullptr;
+  CUcontext context = nullptr;
+  LC0EX_CUDA_CHECK(cuCtxGetCurrent(&context));
+  if (context != cached_context) {
+    wait_function = RuntimeKernel("lc0ex_ordering_wait");
+    signal_function = RuntimeKernel("lc0ex_ordering_signal");
+    cached_context = context;
+  }
+  CUDA_KERNEL_NODE_PARAMS params{};
+  params.func = wait ? wait_function : signal_function;
+  params.gridDimX = params.gridDimY = params.gridDimZ = 1;
+  params.blockDimX = 32;
+  params.blockDimY = params.blockDimZ = 1;
+  params.kernelParams = args.pointers.data();
+  return params;
+}
+
+unsigned long long OrderingTicketArgument(bool wait, uint64_t ticket) {
+  return wait ? (ticket > 0 ? ticket - 1 : 0) : ticket;
+}
+
+// Adds (or launches) the ordering kernel. `wait` waits for the previous
+// execution's ticket, otherwise publishes this execution's ticket.
+template <typename State>
+auto OrderingKernel(State& state, bool wait) {
+  OrderingCounter& counter = GetOrderingCounter(state.compute_ordering_event_);
+  OrderingKernelArguments args{
+      counter.counter, OrderingTicketArgument(wait, state.cs_.ordering_ticket_)};
+  const CUDA_KERNEL_NODE_PARAMS params = OrderingKernelParams(wait, args);
+  if constexpr (!State::is_cuda_capturing) {
+    LC0EX_CUDA_CHECK(cuLaunchKernel(params.func, 1, 1, 1, 32, 1, 1, 0,
+                                    state.cs_.stream_, params.kernelParams,
+                                    nullptr));
+    return;
+  } else {
+    CUgraphNode node = nullptr;
+    LC0EX_CUDA_CHECK(cuGraphAddKernelNode(&node, state.graph_,
+                                          state.dependencies_.data(),
+                                          state.dependencies_.size(), &params));
+    state.graph_.modifications_.emplace_back(
+        [node, cs = &state.cs_, counter_ptr = counter.counter,
+         wait](const CudaGraphExec& exec) {
+          OrderingKernelArguments args{
+              counter_ptr, OrderingTicketArgument(wait, cs->ordering_ticket_)};
+          const CUDA_KERNEL_NODE_PARAMS params =
+              OrderingKernelParams(wait, args);
+          LC0EX_CUDA_CHECK(cuGraphExecKernelNodeSetParams(exec, node, &params));
+        });
+    return node;
+  }
 }
 
 // Returns the device address of pinned host memory, or 0 if it is not mapped.
@@ -1147,6 +1322,23 @@ auto EventRecordNode<event>::operator()(State& state) const {
       e = &state.cs_.policy_download_done_;
       break;
   }
+  const OrderingMode ordering =
+      GetOrderingMode(state.compute_ordering_event_);
+  if (event == RecordEventType::kComputeOrdering &&
+      ordering != OrderingMode::kEvent) {
+    if (ordering == OrderingMode::kTicket) {
+      return OrderingKernel(state, /*wait=*/false);
+    }
+    if constexpr (State::is_cuda_capturing) {
+      CUgraphNode node = nullptr;
+      LC0EX_CUDA_CHECK(cuGraphAddEmptyNode(&node, state.graph_,
+                                           state.dependencies_.data(),
+                                           state.dependencies_.size()));
+      return node;
+    } else {
+      return;
+    }
+  }
   if constexpr (!State::is_cuda_capturing) {
     state.cs_.stream_.RecordEvent(*e);
     return;
@@ -1175,6 +1367,23 @@ auto EventWaitNode<event>::operator()(State& state) const {
     case WaitEventType::kComputeOrdering:
       e = &state.compute_ordering_event_;
       break;
+  }
+  const OrderingMode ordering =
+      GetOrderingMode(state.compute_ordering_event_);
+  if (event == WaitEventType::kComputeOrdering &&
+      ordering != OrderingMode::kEvent) {
+    if (ordering == OrderingMode::kTicket) {
+      return OrderingKernel(state, /*wait=*/true);
+    }
+    if constexpr (State::is_cuda_capturing) {
+      CUgraphNode node = nullptr;
+      LC0EX_CUDA_CHECK(cuGraphAddEmptyNode(&node, state.graph_,
+                                           state.dependencies_.data(),
+                                           state.dependencies_.size()));
+      return node;
+    } else {
+      return;
+    }
   }
   if constexpr (!State::is_cuda_capturing) {
     state.cs_.stream_.WaitEvent(*e);
@@ -1740,6 +1949,26 @@ CudaGraphExec::~CudaGraphExec() {
 template <typename GraphExecType>
 CudaGraphExec::operator GraphExecType() const {
   return reinterpret_cast<GraphExecType>(graph_exec_);
+}
+
+uint64_t NextOrderingTicket(const CudaEvent& compute_ordering_event) {
+  OrderingCounter& counter = GetOrderingCounter(compute_ordering_event);
+  if (counter.mode != OrderingMode::kTicket) return 0;
+  return ++counter.next_ticket;
+}
+
+void SetComputeOrdering(const CudaEvent& compute_ordering_event,
+                        std::string_view mode) {
+  OrderingCounter& counter = GetOrderingCounter(compute_ordering_event);
+  if (mode == "event") {
+    counter.mode = OrderingMode::kEvent;
+  } else if (mode == "ticket") {
+    counter.mode = OrderingMode::kTicket;
+  } else if (mode == "none") {
+    counter.mode = OrderingMode::kNone;
+  } else {
+    throw Exception("Unknown lc0ex ordering mode: " + std::string(mode));
+  }
 }
 
 void CudaGraphExec::Launch(CudaStream& stream) const {

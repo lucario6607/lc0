@@ -554,6 +554,9 @@ class Lc0exBackend final : public Backend {
         weights_path_(
             options.Get<std::string>(SharedBackendParams::kWeightsId)) {
     LCTRACE_FUNCTION_SCOPE;
+    lc0ex::cuda::SetComputeOrdering(
+        compute_ordering_event_,
+        backend_options.GetOrDefault<std::string>("ordering", "event"));
     // Notify weight loading thread that it can start using cuda executable now.
     promise.set_value(&executable_);
     UpdateConfiguration(options);
@@ -849,9 +852,13 @@ void Lc0exBackendComputation<RuntimeType, ComputeType>::ComputeBlocking() {
 
   if (persistent_->graphs_[actual_batch - 1]) {
     std::unique_lock<Mutex> lock(backend_->GetComputeOrderingLock());
+    persistent_->state_.ordering_ticket_ =
+        lc0ex::cuda::NextOrderingTicket(backend_->compute_ordering_event_);
     persistent_->graphs_[actual_batch - 1].Launch(persistent_->state_.stream_);
   } else {
     std::unique_lock<Mutex> lock(backend_->GetComputeOrderingLock());
+    persistent_->state_.ordering_ticket_ =
+        lc0ex::cuda::NextOrderingTicket(backend_->compute_ordering_event_);
     ExecuteProgram(actual_batch);
 
     if (backend_->graph_mode_ != lc0ex::GraphMode::kOff) {
