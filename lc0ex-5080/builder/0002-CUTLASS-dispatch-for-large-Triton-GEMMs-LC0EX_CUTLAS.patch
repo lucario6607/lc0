@@ -1,0 +1,175 @@
+From 2f97983db056be5214572f330b7f08b315f20993 Mon Sep 17 00:00:00 2001
+From: lucario6607 <lucario6607@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 20:00:00 -0500
+Subject: [PATCH 2/6] CUTLASS dispatch for large Triton GEMMs
+ (LC0EX_CUTLASS_MIN_M / LC0EX_CUTLASS_SHAPES); random-data sweep
+
+---
+ .../bt4/kernels/cutlass_matmul.py             | 34 ++++++++---
+ .../src/lczero_triton/bt4/kernels/matmul.py   | 60 +++++++++++++++++++
+ 2 files changed, 85 insertions(+), 9 deletions(-)
+
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py b/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py
+index fc7c7a5..d1b544d 100644
+--- a/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py
++++ b/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py
+@@ -676,6 +676,17 @@ _SWEEP_MAIN = r"""
+ #include <cuda_runtime.h>
+ #include <cstdio>
+ 
++// Random operands: under a power cap, zeroed data lets the card clock higher
++// and favours tiles that lose on real activations.
++__global__ void lc0ex_sweep_fill(cutlass::half_t* p, size_t n, unsigned seed) {{
++  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
++       i += (size_t)gridDim.x * blockDim.x) {{
++    unsigned x = (unsigned)i * 2654435761u + seed;
++    x ^= x >> 13; x *= 0x5bd1e995u; x ^= x >> 15;
++    p[i] = cutlass::half_t(((x & 0xffff) / 65536.f - 0.5f) * 0.2f);
++  }}
++}}
++
+ int main() {{
+   void* d = nullptr;
+   void* a = nullptr;
+@@ -692,12 +703,13 @@ int main() {{
+     std::printf("-1\n");
+     return 0;
+   }}
+-  cudaMemset(d, 0, (size_t)kM * kN * sizeof(ElementC));
+-  cudaMemset(a, 0, (size_t)kM * kK * sizeof(ElementA));
+-  cudaMemset(b, 0, (size_t)kK * kN * sizeof(ElementB));
+-  cudaMemset(bias, 0, (size_t)kN * sizeof(ElementC));
+-  cudaMemset(skip, 0, (size_t)kM * kN * sizeof(ElementC));
+-  cudaMemset(alpha, 0, sizeof(ElementC));
++  lc0ex_sweep_fill<<<256, 256>>>((cutlass::half_t*)d, (size_t)kM * kN, 1u);
++  lc0ex_sweep_fill<<<256, 256>>>((cutlass::half_t*)a, (size_t)kM * kK, 2u);
++  lc0ex_sweep_fill<<<256, 256>>>((cutlass::half_t*)b, (size_t)kK * kN, 3u);
++  lc0ex_sweep_fill<<<256, 256>>>((cutlass::half_t*)bias, (size_t)kN, 4u);
++  lc0ex_sweep_fill<<<256, 256>>>((cutlass::half_t*)skip, (size_t)kM * kN, 5u);
++  {{ const cutlass::half_t one(1.0f);
++    cudaMemcpy(alpha, &one, sizeof(one), cudaMemcpyHostToDevice); }}
+ 
+   const int shared_bytes = (int)sizeof(SharedStorage);
+   if (cudaFuncSetAttribute((const void*)&{entry},
+@@ -710,7 +722,7 @@ int main() {{
+                   (kN + ThreadblockShape::kN - 1) / ThreadblockShape::kN, 1);
+   const dim3 block({threads}, 1, 1);
+ 
+-  for (int i = 0; i < 20; ++i) {{
++  for (int i = 0; i < 400; ++i) {{
+     {entry}<<<grid, block, shared_bytes>>>({sweep_arguments});
+   }}
+   if (cudaDeviceSynchronize() != cudaSuccess) {{
+@@ -722,7 +734,7 @@ int main() {{
+   cudaEventCreate(&start);
+   cudaEventCreate(&stop);
+   cudaEventRecord(start);
+-  for (int i = 0; i < 200; ++i) {{
++  for (int i = 0; i < 1000; ++i) {{
+     {entry}<<<grid, block, shared_bytes>>>({sweep_arguments});
+   }}
+   cudaEventRecord(stop);
+@@ -733,7 +745,7 @@ int main() {{
+   }}
+   float milliseconds = 0.f;
+   cudaEventElapsedTime(&milliseconds, start, stop);
+-  std::printf("%f\n", milliseconds * 1000.f / 200.f);
++  std::printf("%f\n", milliseconds * 1000.f / 1000.f);
+   return 0;
+ }}
+ """
+@@ -759,6 +771,10 @@ _SWEEP_CANDIDATES: tuple[
+     ((128, 256, 32), (64, 64, 32), 4),
+     ((128, 128, 32), (64, 64, 32), 4),
+     ((256, 128, 32), (128, 64, 32), 3),
++    ((128, 256, 32), (64, 64, 32), 3),
++    ((128, 128, 32), (64, 64, 32), 5),
++    ((128, 128, 64), (64, 64, 64), 3),
++    ((256, 128, 32), (64, 64, 32), 4),
+ )
+ 
+ _SWEEP_CACHE_PATH = Path(
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/kernels/matmul.py b/packages/lczero-triton/src/lczero_triton/bt4/kernels/matmul.py
+index 64792be..400677d 100644
+--- a/packages/lczero-triton/src/lczero_triton/bt4/kernels/matmul.py
++++ b/packages/lczero-triton/src/lczero_triton/bt4/kernels/matmul.py
+@@ -1,5 +1,6 @@
+ """Autotuned contiguous FP16 dense matrix multiplication family."""
+ 
++import os
+ from collections.abc import Mapping
+ from dataclasses import dataclass
+ from typing import Literal, cast
+@@ -575,6 +576,39 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
+     )
+ 
+ 
++# Route large GEMMs to CUTLASS: on sm_120 its mma.sync pipeline beats the Triton
++# kernel by ~10 % at the encoder shapes. Small and skinny shapes stay on Triton.
++_CUTLASS_MIN_M = int(os.environ.get("LC0EX_CUTLASS_MIN_M", "0") or 0)
++_CUTLASS_MIN_N = 256
++_CUTLASS_MIN_K = 256
++
++
++# Exact shapes to route, as "MxNxK" (M may be "*" to match any batch).
++_CUTLASS_SHAPES = tuple(
++    tuple(part for part in shape.split("x"))
++    for shape in os.environ.get("LC0EX_CUTLASS_SHAPES", "").split(",")
++    if shape
++)
++
++
++def _use_cutlass(specialization: MatmulSpecialization) -> bool:
++    if specialization.output_f32:
++        return False
++    for m, n, k in _CUTLASS_SHAPES:
++        if (m in ("*", str(specialization.m)) and n == str(specialization.n)
++                and k == str(specialization.k)):
++            return True
++    if _CUTLASS_MIN_M <= 0:
++        return False
++    return (
++        specialization.m >= _CUTLASS_MIN_M
++        and specialization.n >= _CUTLASS_MIN_N
++        and specialization.k >= _CUTLASS_MIN_K
++        and specialization.n % 8 == 0
++        and specialization.k % 8 == 0
++    )
++
++
+ def matmul(
+     builder: ProgramBuilder,
+     kernels: KernelCache,
+@@ -588,6 +622,32 @@ def matmul(
+     alpha: Buffer | None = None,
+ ) -> None:
+     """Append one contiguous row-major dense matrix multiplication."""
++    if _use_cutlass(specialization):
++        from lczero_triton.bt4.kernels.cutlass_matmul import (  # noqa: PLC0415
++            CutlassMatmulSpecialization,
++            cutlass_matmul,
++        )
++
++        cutlass_matmul(
++            builder,
++            kernels,
++            output,
++            activations,
++            weights,
++            CutlassMatmulSpecialization(
++                specialization.m,
++                specialization.n,
++                specialization.k,
++                specialization.architecture,
++                has_bias=specialization.has_bias,
++                activation=specialization.activation,
++                has_skip=specialization.has_skip,
++            ),
++            bias=bias if specialization.has_bias else None,
++            skip=skip if specialization.has_skip else None,
++            alpha=alpha if specialization.has_skip else None,
++        )
++        return
+     builder.set_target(
+         lc0ex_pb2.Target.VENDOR_NVIDIA,
+         f"sm_{specialization.architecture}",
