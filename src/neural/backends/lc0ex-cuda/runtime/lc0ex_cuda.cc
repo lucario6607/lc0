@@ -1370,6 +1370,7 @@ GraphCapture::~GraphCapture() {
 }
 
 template <typename GraphType>
+  requires std::is_pointer_v<GraphType>
 GraphCapture::operator GraphType() const {
   static_assert(std::is_same_v<GraphType, CUgraph>,
                 "GraphType must be CUgraph");
@@ -1629,8 +1630,8 @@ void CudaExecutable::Run(size_t batch_size,
 template void CudaExecutable::Run<float>(
     size_t batch_size, ComputationState<CudaRuntime, float>& state,
     CudaEvent& compute_ordering_event);
-template void CudaExecutable::Run<_Float16>(
-    size_t batch_size, ComputationState<CudaRuntime, _Float16>& state,
+template void CudaExecutable::Run<Half>(
+    size_t batch_size, ComputationState<CudaRuntime, Half>& state,
     CudaEvent& compute_ordering_event);
 
 template <typename T>
@@ -1657,9 +1658,9 @@ template GraphCapture CudaExecutable::Capture<float>(
     GraphMode mode, size_t batch_size,
     ComputationState<CudaRuntime, float>& state,
     CudaEvent& compute_ordering_event);
-template GraphCapture CudaExecutable::Capture<_Float16>(
+template GraphCapture CudaExecutable::Capture<Half>(
     GraphMode mode, size_t batch_size,
-    ComputationState<CudaRuntime, _Float16>& state,
+    ComputationState<CudaRuntime, Half>& state,
     CudaEvent& compute_ordering_event);
 
 }  // namespace lczero::lc0ex::cuda

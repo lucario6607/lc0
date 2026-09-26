@@ -40,8 +40,22 @@
 #endif
 
 #include "proto/lc0ex.pb.h"
+#include "utils/fp16_utils.h"
 
 namespace lczero::lc0ex {
+
+// Host-side storage type for FP16 network IO. MSVC has no _Float16.
+#if defined(_MSC_VER) && !defined(__clang__)
+struct Half {
+  uint16_t bits;
+  Half() = default;
+  Half(float f) : bits(FP32toFP16(f)) {}
+  operator float() const { return FP16toFP32(bits); }
+};
+#else
+using Half = _Float16;
+#endif
+static_assert(sizeof(Half) == 2);
 
 // How an Execution issues its kernel launch loop.
 //   kOff    - a plain launch loop, one cuLaunchKernel per node.

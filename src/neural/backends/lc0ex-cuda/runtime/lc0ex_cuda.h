@@ -419,6 +419,7 @@ class GraphCapture {
   ~GraphCapture();
 
   template <typename GraphType>
+    requires std::is_pointer_v<GraphType>
   operator GraphType() const;
 
   std::vector<GraphExecModification> modifications_;

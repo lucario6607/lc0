@@ -947,7 +947,7 @@ class Lc0exBackendFactory final : public BackendFactory {
 
     {
       using BackendVariant =
-          std::variant<Lc0exBackend<lc0ex::cuda::CudaRuntime, _Float16>*,
+          std::variant<Lc0exBackend<lc0ex::cuda::CudaRuntime, lc0ex::Half>*,
                        Lc0exBackend<lc0ex::cuda::CudaRuntime, float>*>;
       std::promise<BackendVariant> backend_promise;
       auto backend_future = backend_promise.get_future();
@@ -1003,7 +1003,7 @@ class Lc0exBackendFactory final : public BackendFactory {
       if (executable_proto.io_data_type() ==
           pblczero::Buffer_DataType_DATA_TYPE_F16) {
         auto typed_backend =
-            std::make_unique<Lc0exBackend<lc0ex::cuda::CudaRuntime, _Float16>>(
+            std::make_unique<Lc0exBackend<lc0ex::cuda::CudaRuntime, lc0ex::Half>>(
                 options, backend_options, executable_proto, executable_promise);
         backend_promise.set_value(typed_backend.get());
         auto typed_ptr = typed_backend.get();
