@@ -1,0 +1,26 @@
+From 166ad7f1f2a6e3d4eb103677fc5b69c636a9d5cc Mon Sep 17 00:00:00 2001
+From: lucario6607 <lucario6607@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 19:38:43 -0500
+Subject: [PATCH 1/6] sm_120 CUTLASS sweep candidates (+4.9% with
+ LC0EX_CUTLASS_*=1)
+
+---
+ .../src/lczero_triton/bt4/kernels/cutlass_matmul.py          | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py b/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py
+index c7a61b8..fc7c7a5 100644
+--- a/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py
++++ b/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py
+@@ -754,6 +754,11 @@ _SWEEP_CANDIDATES: tuple[
+     ((128, 128, 32), (64, 64, 32), 3),
+     ((128, 256, 32), (64, 64, 32), 3),
+     ((256, 128, 32), (64, 64, 32), 3),
++    # Winners of a standalone sweep on the RTX 5080 (sm_120, 84 SMs).
++    ((128, 256, 32), (64, 128, 32), 3),
++    ((128, 256, 32), (64, 64, 32), 4),
++    ((128, 128, 32), (64, 64, 32), 4),
++    ((256, 128, 32), (128, 64, 32), 3),
+ )
+ 
+ _SWEEP_CACHE_PATH = Path(
