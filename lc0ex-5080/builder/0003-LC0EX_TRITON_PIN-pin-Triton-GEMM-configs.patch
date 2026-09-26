@@ -1,0 +1,76 @@
+From 261d363c7f49ebf79ce99648c51775d4107af1ed Mon Sep 17 00:00:00 2001
+From: lucario6607 <lucario6607@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 20:11:21 -0500
+Subject: [PATCH 3/6] LC0EX_TRITON_PIN: pin Triton GEMM configs
+
+---
+ .../src/lczero_triton/bt4/kernels/matmul.py   | 49 +++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/kernels/matmul.py b/packages/lczero-triton/src/lczero_triton/bt4/kernels/matmul.py
+index 400677d..6518eb0 100644
+--- a/packages/lczero-triton/src/lczero_triton/bt4/kernels/matmul.py
++++ b/packages/lczero-triton/src/lczero_triton/bt4/kernels/matmul.py
+@@ -110,6 +110,45 @@ _MAX_LARGE_WARPS = 8
+ _MAX_LARGE_STAGES = 4
+ 
+ 
++_PIN_PATH = os.environ.get("LC0EX_TRITON_PIN", "")
++_PINS: dict[str, dict[str, int]] | None = None
++
++
++def pin_key(kernel: str, m: int, n: int, k: int, has_bias: object, activation: object) -> str:
++    """Key of one GEMM specialization in the pin file."""
++    return f"{kernel}|{m}|{n}|{k}|{int(bool(has_bias))}|{int(cast('int', activation))}"
++
++
++def _pinned_config(
++    kernel: str, m: int, n: int, k: int, has_bias: object, activation: object
++) -> triton.Config | None:
++    """Return the config pinned by LC0EX_TRITON_PIN for this GEMM, if any.
++
++    Autotuning with three cold repetitions is noisy enough that two builds of
++    the same tree pick different tiles; a pin file makes the choice explicit.
++    """
++    global _PINS  # noqa: PLW0603
++    if not _PIN_PATH:
++        return None
++    if _PINS is None:
++        import json  # noqa: PLC0415
++
++        _PINS = json.loads(open(_PIN_PATH, encoding="utf-8").read())  # noqa: PTH123, SIM115
++    entry = _PINS.get(pin_key(kernel, m, n, k, has_bias, activation))
++    if entry is None:
++        return None
++    return triton.Config(
++        {
++            "block_m": entry["block_m"],
++            "block_n": entry["block_n"],
++            "block_k": entry["block_k"],
++            "group_size_m": entry["group_size_m"],
++        },
++        num_warps=entry["num_warps"],
++        num_stages=entry["num_stages"],
++    )
++
++
+ def _prune_matmul_configs(  # noqa: C901, PLR0912
+     configs: list[triton.Config],
+     named_args: Mapping[str, object],
+@@ -167,6 +206,16 @@ def _prune_matmul_configs(  # noqa: C901, PLR0912
+         pruned.append(conf)
+ 
+     survivors = pruned or [configs[0]]
++    pinned = _pinned_config(
++        "_matmul_skip_kernel" if "skip" in named_args else "_matmul_kernel",
++        m_val,
++        n_val,
++        k_val,
++        named_args.get("has_bias", kwargs.get("has_bias")),
++        named_args.get("activation", kwargs.get("activation")),
++    )
++    if pinned is not None:
++        return [pinned]
+     # Seeding runs LAST, on what structural pruning left, so it can only ever
+     # narrow a legal candidate set and never widen it into something that will
+     # not compile.
