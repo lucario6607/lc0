@@ -1,0 +1,33 @@
+From e336afe4004da617b2085e102fd351f861c86436 Mon Sep 17 00:00:00 2001
+From: lucario6607 <lucario6607@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 20:33:56 -0500
+Subject: [PATCH 4/6] LC0EX_CUTLASS_SWEEP_SET=small
+
+---
+ .../src/lczero_triton/bt4/kernels/cutlass_matmul.py | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py b/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py
+index d1b544d..906d501 100644
+--- a/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py
++++ b/packages/lczero-triton/src/lczero_triton/bt4/kernels/cutlass_matmul.py
+@@ -923,7 +923,18 @@ def _swept_tile(
+         specialization.k, _epilogue_family(specialization),
+     )
+     best: tuple[float, tuple[tuple[int, int, int], tuple[int, int, int], int]] | None = None
+-    for candidate in _SWEEP_CANDIDATES:
++    candidates = _SWEEP_CANDIDATES
++    if os.environ.get("LC0EX_CUTLASS_SWEEP_SET") == "small":
++        # The tiles that ever won on sm_120 across batch sizes.
++        candidates = (
++            ((64, 64, 32), (32, 32, 32), 4),
++            ((64, 128, 32), (32, 64, 32), 4),
++            ((128, 64, 32), (64, 32, 32), 4),
++            ((128, 128, 32), (64, 64, 32), 3),
++            ((128, 256, 32), (64, 64, 32), 3),
++            ((256, 128, 32), (64, 64, 32), 3),
++        )
++    for candidate in candidates:
+         microseconds = _time_candidate(specialization, candidate, include_directories)
+         if microseconds <= 0.0:
+             continue
