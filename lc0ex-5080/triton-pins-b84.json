@@ -1,0 +1,146 @@
+{
+ "_matmul_kernel|84|1|128|1|2": {
+  "block_m": 32,
+  "block_n": 32,
+  "block_k": 64,
+  "group_size_m": 1,
+  "num_warps": 2,
+  "num_stages": 3
+ },
+ "_matmul_kernel|84|3|128|1|0": {
+  "block_m": 32,
+  "block_n": 32,
+  "block_k": 64,
+  "group_size_m": 1,
+  "num_warps": 2,
+  "num_stages": 3
+ },
+ "_matmul_kernel|5376|1024|624|1|0": {
+  "block_m": 128,
+  "block_n": 128,
+  "block_k": 32,
+  "group_size_m": 4,
+  "num_warps": 4,
+  "num_stages": 3
+ },
+ "_matmul_kernel|5376|32|1024|0|0": {
+  "block_m": 64,
+  "block_n": 32,
+  "block_k": 64,
+  "group_size_m": 8,
+  "num_warps": 4,
+  "num_stages": 3
+ },
+ "_matmul_kernel|84|128|8192|1|1": {
+  "block_m": 32,
+  "block_n": 32,
+  "block_k": 128,
+  "group_size_m": 1,
+  "num_warps": 8,
+  "num_stages": 4
+ },
+ "_matmul_kernel|5376|128|1024|1|1": {
+  "block_m": 128,
+  "block_n": 64,
+  "block_k": 64,
+  "group_size_m": 4,
+  "num_warps": 4,
+  "num_stages": 4
+ },
+ "_matmul_skip_kernel|5376|1024|1024|1|0": {
+  "block_m": 128,
+  "block_n": 128,
+  "block_k": 32,
+  "group_size_m": 4,
+  "num_warps": 4,
+  "num_stages": 4
+ },
+ "_matmul_kernel|84|128|2048|1|1": {
+  "block_m": 32,
+  "block_n": 32,
+  "block_k": 128,
+  "group_size_m": 1,
+  "num_warps": 4,
+  "num_stages": 3
+ },
+ "_matmul_kernel|5376|3072|1024|1|0": {
+  "block_m": 128,
+  "block_n": 128,
+  "block_k": 32,
+  "group_size_m": 16,
+  "num_warps": 4,
+  "num_stages": 3
+ },
+ "_matmul_kernel|84|32768|768|0|0": {
+  "block_m": 128,
+  "block_n": 64,
+  "block_k": 32,
+  "group_size_m": 1,
+  "num_warps": 4,
+  "num_stages": 3
+ },
+ "_matmul_kernel|5376|1536|1024|1|1": {
+  "block_m": 128,
+  "block_n": 128,
+  "block_k": 32,
+  "group_size_m": 8,
+  "num_warps": 4,
+  "num_stages": 4
+ },
+ "_matmul_kernel|5376|1024|1024|1|0": {
+  "block_m": 128,
+  "block_n": 128,
+  "block_k": 32,
+  "group_size_m": 16,
+  "num_warps": 4,
+  "num_stages": 3
+ },
+ "_matmul_kernel|84|256|2048|1|0": {
+  "block_m": 32,
+  "block_n": 32,
+  "block_k": 128,
+  "group_size_m": 1,
+  "num_warps": 4,
+  "num_stages": 4
+ },
+ "_matmul_kernel|84|8192|256|1|0": {
+  "block_m": 128,
+  "block_n": 64,
+  "block_k": 32,
+  "group_size_m": 1,
+  "num_warps": 4,
+  "num_stages": 3
+ },
+ "_matmul_kernel|5376|1024|1024|1|1": {
+  "block_m": 128,
+  "block_n": 128,
+  "block_k": 32,
+  "group_size_m": 4,
+  "num_warps": 4,
+  "num_stages": 3
+ },
+ "_matmul_skip_kernel|5376|1024|1536|1|0": {
+  "block_m": 256,
+  "block_n": 64,
+  "block_k": 32,
+  "group_size_m": 1,
+  "num_warps": 4,
+  "num_stages": 3
+ },
+ "_matmul_kernel|2688|4096|256|0|0": {
+  "block_m": 128,
+  "block_n": 128,
+  "block_k": 32,
+  "group_size_m": 4,
+  "num_warps": 4,
+  "num_stages": 4
+ },
+ "_matmul_kernel|5376|32|1024|1|1": {
+  "block_m": 32,
+  "block_n": 32,
+  "block_k": 32,
+  "group_size_m": 1,
+  "num_warps": 2,
+  "num_stages": 3
+ }
+}
