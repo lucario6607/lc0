@@ -654,9 +654,21 @@ class Lc0exBackend final : public Backend {
   // upload directly.
   void InitializeBackendAttributes(const WeightsFile& weights) {
     runtime_.SetCurrent();
-    attributes_.has_mlh = weights.onnx_model().has_output_mlh();
-    attributes_.has_wdl = weights.onnx_model().has_output_wdl();
-    input_format_ = weights.format().network_format().input();
+    const auto& onnx = weights.onnx_model();
+    const auto& format = weights.format().network_format();
+    if (onnx.has_output_wdl() || onnx.has_output_value() ||
+        onnx.has_output_mlh()) {
+      attributes_.has_mlh = onnx.has_output_mlh();
+      attributes_.has_wdl = onnx.has_output_wdl();
+    } else {
+      // A carrier ONNX model only ships initializers, with no graph outputs
+      // to name the heads; take them from the network format instead.
+      attributes_.has_mlh =
+          format.moves_left() == pblczero::NetworkFormat::MOVES_LEFT_V1;
+      attributes_.has_wdl =
+          format.value() == pblczero::NetworkFormat::VALUE_WDL;
+    }
+    input_format_ = format.input();
   }
 
  private:
