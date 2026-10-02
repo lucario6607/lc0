@@ -1,0 +1,393 @@
+From 4f0748c3d714951b990d2aba222f24de066c79ba Mon Sep 17 00:00:00 2001
+From: lucario6607 <lucario6607@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 09:01:32 -0500
+Subject: [PATCH 5/8] LC0EX_INT8: W8A8 GEMMs from carrier nets (QKV,
+ out-projection, FFN1)
+
+---
+ .../lczero_triton/bt4/kernels/int8_matmul.py  | 223 ++++++++++++++++++
+ .../src/lczero_triton/bt4/network.py          | 106 ++++++++-
+ 2 files changed, 326 insertions(+), 3 deletions(-)
+ create mode 100755 packages/lczero-triton/src/lczero_triton/bt4/kernels/int8_matmul.py
+
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/kernels/int8_matmul.py b/packages/lczero-triton/src/lczero_triton/bt4/kernels/int8_matmul.py
+new file mode 100755
+index 0000000..073e056
+--- /dev/null
++++ b/packages/lczero-triton/src/lczero_triton/bt4/kernels/int8_matmul.py
+@@ -0,0 +1,223 @@
++"""W8A8 GEMMs for nets that carry int8 copies of their encoder weights.
++
++A carrier net ships, next to the FP16 weights, per encoder
++`q1/{attn_in,attn_out,ffn_in}/{w,scale,bias,r}`: symmetric int8 weights stored
++as uint8 bytes in [out, in] order, a per-output-channel FP32 `scale`, the FP32
++layer `bias` and a per-input-channel FP32 `r`. The layer is
++
++    y[o] = scale[o] * sum_i round(x[i] * r[i]) * w[o, i] + bias[o]
++
++i.e. `r` quantizes the activations per input channel and the weights carry
++1/r, so the GEMM runs entirely on int8 tensor cores with an int32 accumulator.
++"""
++
++from dataclasses import dataclass
++from typing import Literal
++
++import torch
++import triton
++import triton.language as tl
++from lc0ex import Buffer, KernelArtifact, ProgramBuilder
++from lc0ex.proto import lc0ex_pb2
++from lc0ex.triton_module_compiler import artifact_from_triton
++
++from lczero_triton.bt4.kernels._cache import KernelCache
++
++Activation = Literal["none", "mish"]
++_ACTIVATIONS = {"none": 0, "mish": 1}
++_MISH_BRANCH = tl.constexpr(-0.6)
++_POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
++
++# Measured on an RTX 5080 at the BT4 encoder shapes (~375 int8 TOPS).
++_BLOCK_M = 128
++_BLOCK_N = 128
++_BLOCK_K = 64
++_WARPS = 4
++_STAGES = 3
++_QUANTIZE_BLOCK = 2048
++
++
++@triton.jit
++def _quantize_kernel(
++    output,
++    input_,
++    reciprocal_scale,
++    element_count: tl.constexpr,
++    width: tl.constexpr,
++    block: tl.constexpr,
++) -> None:
++    """output = clamp(round(input * r[column]), -127, 127) as int8."""
++    offsets = tl.program_id(0) * block + tl.arange(0, block)
++    valid = offsets < element_count
++    values = tl.load(input_ + offsets, mask=valid, other=0.0).to(tl.float32)
++    values *= tl.load(reciprocal_scale + offsets % width, mask=valid, other=0.0)
++    values = tl.where(values >= 0, tl.floor(values + 0.5), tl.ceil(values - 0.5))
++    values = tl.minimum(tl.maximum(values, -127.0), 127.0)
++    tl.store(output + offsets, values.to(tl.int8), mask=valid)
++
++
++@triton.jit
++def _int8_matmul_kernel(  # noqa: PLR0913
++    output,
++    activations,
++    weights,
++    scale,
++    bias,
++    skip,
++    m: tl.constexpr,
++    n: tl.constexpr,
++    k: tl.constexpr,
++    activation: tl.constexpr,
++    has_skip: tl.constexpr,
++    block_m: tl.constexpr,
++    block_n: tl.constexpr,
++    block_k: tl.constexpr,
++) -> None:
++    """output = act(scale * (A_int8 @ W_int8^T) + bias) [+ skip] in FP16."""
++    program = tl.program_id(0)
++    programs_n: tl.constexpr = n // block_n
++    tile_m = program // programs_n
++    tile_n = program % programs_n
++    rows = tile_m * block_m + tl.arange(0, block_m)
++    columns = tile_n * block_n + tl.arange(0, block_n)
++    offsets_k = tl.arange(0, block_k)
++    row_valid = rows < m
++    a_pointers = activations + rows[:, None] * k + offsets_k[None, :]
++    # The weights are [n, k] row-major: a column-major B for the int8 MMA.
++    b_pointers = weights + columns[None, :] * k + offsets_k[:, None]
++    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
++    for _ in range(k // block_k):
++        a = tl.load(a_pointers, mask=row_valid[:, None], other=0)
++        b = tl.load(b_pointers)
++        accumulator = tl.dot(a, b, accumulator, out_dtype=tl.int32)
++        a_pointers += block_k
++        b_pointers += block_k
++    values = accumulator.to(tl.float32) * tl.load(scale + columns)[None, :]
++    values += tl.load(bias + columns)[None, :]
++    if activation == 1:
++        exponential = tl.exp(values)
++        numerator = exponential * exponential + 2.0 * exponential
++        division = values / (numerator + 2.0)
++        values = tl.where(values <= _MISH_BRANCH, numerator * division, values - 2.0 * division)
++    output_offsets = rows[:, None] * n + columns[None, :]
++    if has_skip:
++        values += tl.load(skip + output_offsets, mask=row_valid[:, None], other=0.0).to(tl.float32)
++    tl.store(output + output_offsets, values.to(tl.float16), mask=row_valid[:, None])
++
++
++@dataclass(frozen=True, slots=True)
++class Int8MatmulSpecialization:
++    """One W8A8 GEMM: [m, k] int8 activations times [n, k] int8 weights."""
++
++    m: int
++    n: int
++    k: int
++    architecture: int
++    activation: Activation = "none"
++    has_skip: bool = False
++
++
++@dataclass(frozen=True, slots=True)
++class QuantizeSpecialization:
++    """Per-column activation quantization of an [rows, width] FP16 tensor."""
++
++    rows: int
++    width: int
++    architecture: int
++
++
++def compile_quantize(specialization: QuantizeSpecialization) -> KernelArtifact:
++    """Compile the activation quantization kernel."""
++    count = specialization.rows * specialization.width
++    output = torch.empty(count, dtype=torch.int8, device="cuda")
++    input_ = torch.zeros(count, dtype=torch.float16, device="cuda")
++    reciprocal = torch.ones(specialization.width, dtype=torch.float32, device="cuda")
++    grid = (triton.cdiv(count, _QUANTIZE_BLOCK), 1, 1)
++    compiled = _quantize_kernel[grid[:1]](
++        output, input_, reciprocal, count, specialization.width, _QUANTIZE_BLOCK, num_warps=4
++    )
++    return artifact_from_triton(compiled, grid=grid, parameters=(_POINTER,) * 3)
++
++
++def compile_int8_matmul(specialization: Int8MatmulSpecialization) -> KernelArtifact:
++    """Compile one W8A8 GEMM specialization."""
++    s = specialization
++    output = torch.empty((s.m, s.n), dtype=torch.float16, device="cuda")
++    activations = torch.zeros((s.m, s.k), dtype=torch.int8, device="cuda")
++    weights = torch.zeros((s.n, s.k), dtype=torch.int8, device="cuda")
++    vector = torch.zeros(s.n, dtype=torch.float32, device="cuda")
++    skip = torch.zeros((s.m, s.n), dtype=torch.float16, device="cuda")
++    grid = (triton.cdiv(s.m, _BLOCK_M) * (s.n // _BLOCK_N), 1, 1)
++    compiled = _int8_matmul_kernel[grid[:1]](
++        output, activations, weights, vector, vector, skip,
++        s.m, s.n, s.k, _ACTIVATIONS[s.activation], s.has_skip,
++        _BLOCK_M, _BLOCK_N, _BLOCK_K,
++        num_warps=_WARPS, num_stages=_STAGES,
++    )
++    return artifact_from_triton(compiled, grid=grid, parameters=(_POINTER,) * 6)
++
++
++def quantize(
++    builder: ProgramBuilder,
++    kernels: KernelCache,
++    output: Buffer,
++    input_: Buffer,
++    reciprocal_scale: Buffer,
++    specialization: QuantizeSpecialization,
++) -> None:
++    """Append per-column int8 quantization of an activation tensor."""
++    builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, f"sm_{specialization.architecture}")
++    kernel = kernels.get(compile_quantize, specialization)
++    builder.call(kernel, output, input_, reciprocal_scale, readonly=[input_, reciprocal_scale])
++
++
++def int8_matmul(  # noqa: PLR0913
++    builder: ProgramBuilder,
++    kernels: KernelCache,
++    output: Buffer,
++    activations: Buffer,
++    weights: Buffer,
++    scale: Buffer,
++    bias: Buffer,
++    specialization: Int8MatmulSpecialization,
++    *,
++    skip: Buffer | None = None,
++) -> None:
++    """Append one W8A8 GEMM."""
++    if specialization.has_skip != (skip is not None):
++        message = "Int8MatmulSpecialization.has_skip must match the skip argument."
++        raise ValueError(message)
++    builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, f"sm_{specialization.architecture}")
++    kernel = kernels.get(compile_int8_matmul, specialization)
++    skip_argument = skip if skip is not None else bias
++    readonly = [activations, weights, scale, bias] + ([skip] if skip is not None else [])
++    builder.call(kernel, output, activations, weights, scale, bias, skip_argument, readonly=readonly)
++
++
++def carrier_layer(
++    builder: ProgramBuilder,
++    prefix: str,
++    block: str,
++    out_width: int,
++    in_width: int,
++) -> tuple[Buffer, Buffer, Buffer, Buffer]:
++    """Declare one carrier layer's (weights, scale, bias, r) persistent buffers."""
++    name = f"{prefix}/q1/{block}"
++    return (
++        builder.persistent_buffer(
++            name=f"{name}/w", shape=(out_width, in_width),
++            dtype=lc0ex_pb2.Buffer.DATA_TYPE_U8, alignment_bytes=256,
++        ),
++        builder.persistent_buffer(
++            name=f"{name}/scale", shape=(out_width,),
++            dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32, alignment_bytes=256,
++        ),
++        builder.persistent_buffer(
++            name=f"{name}/bias", shape=(out_width,),
++            dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32, alignment_bytes=256,
++        ),
++        builder.persistent_buffer(
++            name=f"{name}/r", shape=(in_width,),
++            dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32, alignment_bytes=256,
++        ),
++    )
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/network.py b/packages/lczero-triton/src/lczero_triton/bt4/network.py
+index d57d096..9ea4748 100644
+--- a/packages/lczero-triton/src/lczero_triton/bt4/network.py
++++ b/packages/lczero-triton/src/lczero_triton/bt4/network.py
+@@ -23,6 +23,13 @@ from lczero_triton.bt4.kernels.batched_matmul import (
+     BatchedMatmulSpecialization,
+     batched_matmul,
+ )
++from lczero_triton.bt4.kernels.int8_matmul import (
++    Int8MatmulSpecialization,
++    QuantizeSpecialization,
++    carrier_layer,
++    int8_matmul,
++    quantize,
++)
+ from lczero_triton.bt4.kernels.cutlass_matmul import (
+     CutlassMatmulSpecialization,
+     cutlass_matmul,
+@@ -73,6 +80,8 @@ _CUTLASS_FFN1 = os.environ.get("LC0EX_CUTLASS_FFN1") == "1"
+ _CUTLASS_FFN2 = os.environ.get("LC0EX_CUTLASS_FFN2") == "1"
+ _CUTLASS_OUTPROJ = os.environ.get("LC0EX_CUTLASS_OUTPROJ") == "1"
+ _CUTLASS_QKV = os.environ.get("LC0EX_CUTLASS_QKV") == "1"
++# Use the int8 encoder weights a carrier net ships (QKV, out-projection, FFN1).
++_INT8 = os.environ.get("LC0EX_INT8") == "1"
+ 
+ # Chunked attention segment (round 14 item A.2).  `LC0EX_SEGMENT_CHUNK` is the
+ # chunk size in SAMPLES; 0 or unset leaves the segment whole and this file emits
+@@ -1023,6 +1032,13 @@ def _attention(  # noqa: PLR0913
+         name=f"{prefix}/mha/out/dense/b/w",
+         path=f"{path}.mha.dense_b",
+     )
++    if _INT8:
++        attn_in = carrier_layer(
++            context.builder, prefix, "attn_in", 3 * model_width, body_width
++        )
++        attn_out = carrier_layer(
++            context.builder, prefix, "attn_out", body_width, model_width
++        )
+     gammas = _vector_f16(
+         context,
+         encoder.ln1_gammas,
+@@ -1163,7 +1179,31 @@ def _attention(  # noqa: PLR0913
+                     context.architecture,
+                 ),
+             )
+-        if _CUTLASS_QKV:
++        if _INT8:
++            quantized_body = context.builder.temporary_buffer(
++                size_bytes=chunk_rows * body_width, alignment_bytes=256
++            )
++            quantize(
++                context.builder,
++                context.kernels,
++                quantized_body,
++                body_chunk,
++                attn_in[3],
++                QuantizeSpecialization(chunk_rows, body_width, context.architecture),
++            )
++            int8_matmul(
++                context.builder,
++                context.kernels,
++                qkv_activations,
++                quantized_body,
++                attn_in[0],
++                attn_in[1],
++                attn_in[2],
++                Int8MatmulSpecialization(
++                    chunk_rows, 3 * model_width, body_width, context.architecture
++                ),
++            )
++        elif _CUTLASS_QKV:
+             cutlass_matmul(
+                 context.builder,
+                 context.kernels,
+@@ -1213,7 +1253,36 @@ def _attention(  # noqa: PLR0913
+                 has_smolgen=has_smolgen,
+             ),
+         )
+-        if _CUTLASS_OUTPROJ:
++        if _INT8:
++            quantized_merged = context.builder.temporary_buffer(
++                size_bytes=chunk_rows * model_width, alignment_bytes=256
++            )
++            quantize(
++                context.builder,
++                context.kernels,
++                quantized_merged,
++                merged,
++                attn_out[3],
++                QuantizeSpecialization(chunk_rows, model_width, context.architecture),
++            )
++            int8_matmul(
++                context.builder,
++                context.kernels,
++                branch,
++                quantized_merged,
++                attn_out[0],
++                attn_out[1],
++                attn_out[2],
++                Int8MatmulSpecialization(
++                    chunk_rows,
++                    body_width,
++                    model_width,
++                    context.architecture,
++                    has_skip=True,
++                ),
++                skip=body_chunk,
++            )
++        elif _CUTLASS_OUTPROJ:
+             cutlass_matmul(
+                 context.builder,
+                 context.kernels,
+@@ -1346,7 +1415,38 @@ def _ffn(
+ 
+     token_rows = context.batch_size * _SQUARE_COUNT
+     hidden = _temporary_f16(context, element_count=token_rows * hidden_width)
+-    if _CUTLASS_FFN1:
++    if _INT8:
++        ffn_in = carrier_layer(
++            context.builder, prefix, "ffn_in", hidden_width, body_width
++        )
++        quantized_body = context.builder.temporary_buffer(
++            size_bytes=token_rows * body_width, alignment_bytes=256
++        )
++        quantize(
++            context.builder,
++            context.kernels,
++            quantized_body,
++            body,
++            ffn_in[3],
++            QuantizeSpecialization(token_rows, body_width, context.architecture),
++        )
++        int8_matmul(
++            context.builder,
++            context.kernels,
++            hidden,
++            quantized_body,
++            ffn_in[0],
++            ffn_in[1],
++            ffn_in[2],
++            Int8MatmulSpecialization(
++                token_rows,
++                hidden_width,
++                body_width,
++                context.architecture,
++                activation="mish",
++            ),
++        )
++    elif _CUTLASS_FFN1:
+         cutlass_matmul(
+             context.builder,
+             context.kernels,
