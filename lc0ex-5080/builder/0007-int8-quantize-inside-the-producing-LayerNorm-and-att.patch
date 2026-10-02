@@ -1,0 +1,462 @@
+From 4fc736d6e707e7d65dc8eca7e31a1e5caab134f6 Mon Sep 17 00:00:00 2001
+From: lucario6607 <lucario6607@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 09:09:54 -0500
+Subject: [PATCH 7/8] int8: quantize inside the producing LayerNorm and
+ attention kernels
+
+---
+ .../lczero_triton/bt4/kernels/int8_matmul.py  | 171 +++++++++++++++++
+ .../src/lczero_triton/bt4/network.py          | 172 +++++++++++++-----
+ 2 files changed, 300 insertions(+), 43 deletions(-)
+
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/kernels/int8_matmul.py b/packages/lczero-triton/src/lczero_triton/bt4/kernels/int8_matmul.py
+index 073e056..4f92053 100755
+--- a/packages/lczero-triton/src/lczero_triton/bt4/kernels/int8_matmul.py
++++ b/packages/lczero-triton/src/lczero_triton/bt4/kernels/int8_matmul.py
+@@ -221,3 +221,174 @@ def carrier_layer(
+             dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32, alignment_bytes=256,
+         ),
+     )
++
++
++@triton.jit
++def _round_to_int8(values):
++    values = tl.where(values >= 0, tl.floor(values + 0.5), tl.ceil(values - 0.5))
++    return tl.minimum(tl.maximum(values, -127.0), 127.0).to(tl.int8)
++
++
++@triton.jit
++def _layer_norm_quantize_kernel(
++    output,
++    quantized,
++    input_,
++    gammas,
++    betas,
++    reciprocal_scale,
++    width: tl.constexpr,
++    epsilon: tl.constexpr,
++) -> None:
++    """LayerNorm one row to FP16 and also write it quantized for an int8 GEMM.
++
++    The int8 copy is taken from the FP16-rounded result, so it is exactly what a
++    separate quantize kernel would produce from `output`.
++    """
++    row = tl.program_id(0)
++    offsets = tl.arange(0, width)
++    values = tl.load(input_ + row * width + offsets).to(tl.float32)
++    mean = tl.sum(values, axis=0) / width
++    centered = values - mean
++    variance = tl.sum(centered * centered, axis=0) / width
++    normalized = centered / tl.sqrt(variance + epsilon)
++    result = (
++        normalized * tl.load(gammas + offsets).to(tl.float32)
++        + tl.load(betas + offsets).to(tl.float32)
++    ).to(tl.float16)
++    tl.store(output + row * width + offsets, result)
++    scaled = result.to(tl.float32) * tl.load(reciprocal_scale + offsets)
++    tl.store(quantized + row * width + offsets, _round_to_int8(scaled))
++
++
++_TWICE_HALF_MAX = tl.constexpr(131008.0)
++
++
++@triton.jit
++def _attention_quantize_kernel(
++    quantized,
++    qkv,
++    smolgen,
++    scale_ptr,
++    reciprocal_scale,
++    model_width: tl.constexpr,
++    head_depth: tl.constexpr,
++    heads_per_sample: tl.constexpr,
++) -> None:
++    """Fused attention (QK + Smolgen + softmax + V) writing int8 for the out-projection.
++
++    Same arithmetic as `_fused_attention_kernel`; the FP16 head output is
++    quantized with the out-projection's per-channel `r` instead of stored.
++    """
++    matrix = tl.program_id(0)
++    sample = matrix // heads_per_sample
++    head = matrix % heads_per_sample
++    scale = tl.load(scale_ptr)
++    stride_row: tl.constexpr = 3 * model_width
++    offs_m = tl.arange(0, 64)
++    offs_d = tl.arange(0, head_depth)
++    base = sample * (64 * stride_row) + head * head_depth
++    q = tl.load(qkv + base + offs_m[:, None] * stride_row + offs_d[None, :]).to(tl.float16)
++    k = tl.load(qkv + base + model_width + offs_m[:, None] * stride_row + offs_d[None, :]).to(tl.float16)
++    qk = tl.dot(q, tl.trans(k), out_dtype=tl.float16) * scale
++    logits = qk + tl.load(smolgen + matrix * 4096 + offs_m[:, None] * 64 + offs_m[None, :])
++    is_nan = logits != logits  # noqa: PLR0124
++    clamped = tl.minimum(tl.maximum(logits, -_TWICE_HALF_MAX), _TWICE_HALF_MAX)
++    logits = tl.where(is_nan, logits, clamped)
++    max_val = tl.max(logits, axis=1)
++    exp_val = tl.exp(logits - max_val[:, None])
++    sum_val = tl.sum(exp_val, axis=1)
++    probs = (exp_val / sum_val[:, None]).to(tl.float16)
++    v = tl.load(qkv + base + 2 * model_width + offs_m[:, None] * stride_row + offs_d[None, :]).to(tl.float16)
++    out_val = tl.dot(probs, v, out_dtype=tl.float16)
++    scaled = out_val.to(tl.float32) * tl.load(reciprocal_scale + head * head_depth + offs_d)[None, :]
++    offsets = sample * (64 * model_width) + head * head_depth + offs_m[:, None] * model_width + offs_d[None, :]
++    tl.store(quantized + offsets, _round_to_int8(scaled))
++
++
++@dataclass(frozen=True, slots=True)
++class LayerNormQuantizeSpecialization:
++    """LayerNorm of [rows, width] FP16 with an extra int8 output."""
++
++    rows: int
++    width: int
++    architecture: int
++    epsilon: float = 0.001
++
++
++@dataclass(frozen=True, slots=True)
++class AttentionQuantizeSpecialization:
++    """Fused smolgen attention writing int8 head outputs."""
++
++    attention_batches: int
++    model_width: int
++    head_depth: int
++    heads_per_sample: int
++    architecture: int
++
++
++def compile_layer_norm_quantize(s: LayerNormQuantizeSpecialization) -> KernelArtifact:
++    """Compile the LayerNorm + int8 quantization kernel."""
++    output = torch.empty((s.rows, s.width), dtype=torch.float16, device="cuda")
++    quantized = torch.empty((s.rows, s.width), dtype=torch.int8, device="cuda")
++    input_ = torch.zeros((s.rows, s.width), dtype=torch.float16, device="cuda")
++    vector16 = torch.zeros(s.width, dtype=torch.float16, device="cuda")
++    vector32 = torch.ones(s.width, dtype=torch.float32, device="cuda")
++    compiled = _layer_norm_quantize_kernel[(s.rows,)](
++        output, quantized, input_, vector16, vector16, vector32, s.width, s.epsilon, num_warps=4
++    )
++    return artifact_from_triton(compiled, grid=(s.rows, 1, 1), parameters=(_POINTER,) * 6)
++
++
++def compile_attention_quantize(s: AttentionQuantizeSpecialization) -> KernelArtifact:
++    """Compile the int8-output fused attention kernel."""
++    rows = s.attention_batches // s.heads_per_sample * 64
++    quantized = torch.empty((rows, s.model_width), dtype=torch.int8, device="cuda")
++    qkv = torch.zeros((rows, 3 * s.model_width), dtype=torch.float16, device="cuda")
++    smolgen = torch.zeros((s.attention_batches, 64, 64), dtype=torch.float16, device="cuda")
++    scale = torch.ones(1, dtype=torch.float16, device="cuda")
++    reciprocal = torch.ones(s.model_width, dtype=torch.float32, device="cuda")
++    compiled = _attention_quantize_kernel[(s.attention_batches,)](
++        quantized, qkv, smolgen, scale, reciprocal,
++        s.model_width, s.head_depth, s.heads_per_sample, num_warps=4,
++    )
++    return artifact_from_triton(compiled, grid=(s.attention_batches, 1, 1), parameters=(_POINTER,) * 5)
++
++
++def layer_norm_quantize(  # noqa: PLR0913
++    builder: ProgramBuilder,
++    kernels: KernelCache,
++    output: Buffer,
++    quantized: Buffer,
++    input_: Buffer,
++    gammas: Buffer,
++    betas: Buffer,
++    reciprocal_scale: Buffer,
++    specialization: LayerNormQuantizeSpecialization,
++) -> None:
++    """Append LayerNorm writing both FP16 and the consumer's int8 input."""
++    builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, f"sm_{specialization.architecture}")
++    kernel = kernels.get(compile_layer_norm_quantize, specialization)
++    builder.call(
++        kernel, output, quantized, input_, gammas, betas, reciprocal_scale,
++        readonly=[input_, gammas, betas, reciprocal_scale],
++    )
++
++
++def attention_quantize(  # noqa: PLR0913
++    builder: ProgramBuilder,
++    kernels: KernelCache,
++    quantized: Buffer,
++    qkv: Buffer,
++    smolgen: Buffer,
++    scale: Buffer,
++    reciprocal_scale: Buffer,
++    specialization: AttentionQuantizeSpecialization,
++) -> None:
++    """Append fused attention whose output is quantized for the out-projection."""
++    builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, f"sm_{specialization.architecture}")
++    kernel = kernels.get(compile_attention_quantize, specialization)
++    builder.call(
++        kernel, quantized, qkv, smolgen, scale, reciprocal_scale,
++        readonly=[qkv, smolgen, scale, reciprocal_scale],
++    )
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/network.py b/packages/lczero-triton/src/lczero_triton/bt4/network.py
+index ee1a50b..cb95d72 100644
+--- a/packages/lczero-triton/src/lczero_triton/bt4/network.py
++++ b/packages/lczero-triton/src/lczero_triton/bt4/network.py
+@@ -24,10 +24,14 @@ from lczero_triton.bt4.kernels.batched_matmul import (
+     batched_matmul,
+ )
+ from lczero_triton.bt4.kernels.int8_matmul import (
++    AttentionQuantizeSpecialization,
+     Int8MatmulSpecialization,
++    LayerNormQuantizeSpecialization,
+     QuantizeSpecialization,
++    attention_quantize,
+     carrier_layer,
+     int8_matmul,
++    layer_norm_quantize,
+     quantize,
+ )
+ from lczero_triton.bt4.kernels.cutlass_matmul import (
+@@ -742,6 +746,7 @@ def _encoder_tower(
+             body_width,
+             encoder,
+             prefix=f"/encoder{index}",
++            next_prefix=f"/encoder{index + 1}" if index + 1 < encoder_count else None,
+             head_count=weights.headcount,
+             shared_smolgen=weights.smolgen_w if _has_smolgen(weights) else None,
+         )
+@@ -757,6 +762,77 @@ def _encoder_tower(
+     return body
+ 
+ 
++def _carrier(
++    context: _BuildContext, prefix: str, block: str, out_width: int, in_width: int
++) -> tuple[Buffer, Buffer, Buffer, Buffer]:
++    """Declare a carrier layer's buffers once per executable."""
++    key = f"{prefix}/q1/{block}"
++    if key not in context.shared_buffers:
++        layer = carrier_layer(context.builder, prefix, block, out_width, in_width)
++        for suffix, buffer in zip(("/w", "/scale", "/bias", "/r"), layer, strict=True):
++            context.shared_buffers[key + suffix] = buffer
++    return tuple(  # type: ignore[return-value]
++        context.shared_buffers[key + suffix] for suffix in ("/w", "/scale", "/bias", "/r")
++    )
++
++
++# (batch size, id of an FP16 activation, carrier block) -> (activation, int8 copy)
++# written by the activation's producer. The activation is kept in the value so
++# its id cannot be reused while the entry exists.
++_QUANTIZED: dict[tuple[int, int, str], tuple[Buffer, Buffer]] = {}
++
++
++def _quantized_input(
++    context: _BuildContext,
++    activation: Buffer,
++    block: str,
++    reciprocal_scale: Buffer,
++    rows: int,
++    width: int,
++) -> Buffer:
++    """Return the int8 copy of `activation` for `block`, quantizing if no producer did."""
++    entry = _QUANTIZED.get((context.batch_size, id(activation), block))
++    if entry is not None:
++        return entry[1]
++    quantized = context.builder.temporary_buffer(size_bytes=rows * width, alignment_bytes=256)
++    quantize(
++        context.builder,
++        context.kernels,
++        quantized,
++        activation,
++        reciprocal_scale,
++        QuantizeSpecialization(rows, width, context.architecture),
++    )
++    return quantized
++
++
++def _layer_norm_for_int8(  # noqa: PLR0913
++    context: _BuildContext,
++    output: Buffer,
++    input_: Buffer,
++    gammas: Buffer,
++    betas: Buffer,
++    reciprocal_scale: Buffer,
++    block: str,
++    rows: int,
++    width: int,
++) -> None:
++    """LayerNorm that also hands its int8 copy to the next carrier GEMM."""
++    quantized = context.builder.temporary_buffer(size_bytes=rows * width, alignment_bytes=256)
++    layer_norm_quantize(
++        context.builder,
++        context.kernels,
++        output,
++        quantized,
++        input_,
++        gammas,
++        betas,
++        reciprocal_scale,
++        LayerNormQuantizeSpecialization(rows, width, context.architecture),
++    )
++    _QUANTIZED[(context.batch_size, id(output), block)] = (output, quantized)
++
++
+ def _has_smolgen(weights: net_pb2.Weights) -> bool:
+     """Report whether this network carries smolgen at all.
+ 
+@@ -777,6 +853,7 @@ def _encoder(  # noqa: PLR0913
+     prefix: str,
+     head_count: int,
+     shared_smolgen: net_pb2.Weights.Layer | None,
++    next_prefix: str | None = None,
+ ) -> Buffer:
+     """Build one attention and FFN encoder residual block, smolgen optional."""
+     if shared_smolgen is None:
+@@ -801,7 +878,9 @@ def _encoder(  # noqa: PLR0913
+         shared_smolgen=shared_smolgen,
+         generated_width=generated_width,
+     )
+-    return _ffn(context, attended, body_width, encoder, prefix=prefix)
++    return _ffn(
++        context, attended, body_width, encoder, prefix=prefix, next_prefix=next_prefix
++    )
+ 
+ 
+ def _smolgen(  # noqa: PLR0913
+@@ -1037,13 +1116,11 @@ def _attention(  # noqa: PLR0913
+         path=f"{path}.mha.dense_b",
+     )
+     if "qkv" in _INT8_LAYERS:
+-        attn_in = carrier_layer(
+-            context.builder, prefix, "attn_in", 3 * model_width, body_width
+-        )
++        attn_in = _carrier(context, prefix, "attn_in", 3 * model_width, body_width)
+     if "out" in _INT8_LAYERS:
+-        attn_out = carrier_layer(
+-            context.builder, prefix, "attn_out", body_width, model_width
+-        )
++        attn_out = _carrier(context, prefix, "attn_out", body_width, model_width)
++    if "ffn1" in _INT8_LAYERS:
++        ffn_in = _carrier(context, prefix, "ffn_in", 1536, body_width)
+     gammas = _vector_f16(
+         context,
+         encoder.ln1_gammas,
+@@ -1185,16 +1262,8 @@ def _attention(  # noqa: PLR0913
+                 ),
+             )
+         if "qkv" in _INT8_LAYERS:
+-            quantized_body = context.builder.temporary_buffer(
+-                size_bytes=chunk_rows * body_width, alignment_bytes=256
+-            )
+-            quantize(
+-                context.builder,
+-                context.kernels,
+-                quantized_body,
+-                body_chunk,
+-                attn_in[3],
+-                QuantizeSpecialization(chunk_rows, body_width, context.architecture),
++            quantized_body = _quantized_input(
++                context, body_chunk, "attn_in", attn_in[3], chunk_rows, body_width
+             )
+             int8_matmul(
+                 context.builder,
+@@ -1242,7 +1311,26 @@ def _attention(  # noqa: PLR0913
+                 ),
+                 bias=qkv_bias,
+             )
+-        fused_attention(
++        fused_quantize = "out" in _INT8_LAYERS and has_smolgen
++        if fused_quantize:
++            quantized_merged = context.builder.temporary_buffer(
++                size_bytes=chunk_rows * model_width, alignment_bytes=256
++            )
++            attention_quantize(
++                context.builder,
++                context.kernels,
++                quantized_merged,
++                qkv_activations,
++                smolgen_logits,
++                scale,
++                attn_out[3],
++                AttentionQuantizeSpecialization(
++                    chunk_batches, model_width, head_depth, head_count,
++                    context.architecture,
++                ),
++            )
++        else:
++          fused_attention(
+             context.builder,
+             context.kernels,
+             merged,
+@@ -1259,17 +1347,10 @@ def _attention(  # noqa: PLR0913
+             ),
+         )
+         if "out" in _INT8_LAYERS:
+-            quantized_merged = context.builder.temporary_buffer(
+-                size_bytes=chunk_rows * model_width, alignment_bytes=256
+-            )
+-            quantize(
+-                context.builder,
+-                context.kernels,
+-                quantized_merged,
+-                merged,
+-                attn_out[3],
+-                QuantizeSpecialization(chunk_rows, model_width, context.architecture),
+-            )
++            if not fused_quantize:
++                quantized_merged = _quantized_input(
++                    context, merged, "attn_out", attn_out[3], chunk_rows, model_width
++                )
+             int8_matmul(
+                 context.builder,
+                 context.kernels,
+@@ -1343,7 +1424,12 @@ def _attention(  # noqa: PLR0913
+                     architecture=context.architecture,
+                 ),
+             )
+-    if _CHUNK_LN_WHOLE:
++    if _CHUNK_LN_WHOLE and "ffn1" in _INT8_LAYERS and not chunk:
++        _layer_norm_for_int8(
++            context, attended, whole_branch, gammas, betas, ffn_in[3], "ffn_in",
++            token_rows, body_width,
++        )
++    elif _CHUNK_LN_WHOLE:
+         layer_norm(
+             context.builder,
+             context.kernels,
+@@ -1370,6 +1456,7 @@ def _ffn(
+     encoder: net_pb2.Weights.EncoderLayer,
+     *,
+     prefix: str,
++    next_prefix: str | None = None,
+ ) -> Buffer:
+     """Build an encoder FFN and its DeepNorm residual layer normalization."""
+     path = f"weights.{prefix[1:]}"
+@@ -1421,19 +1508,9 @@ def _ffn(
+     token_rows = context.batch_size * _SQUARE_COUNT
+     hidden = _temporary_f16(context, element_count=token_rows * hidden_width)
+     if "ffn1" in _INT8_LAYERS:
+-        ffn_in = carrier_layer(
+-            context.builder, prefix, "ffn_in", hidden_width, body_width
+-        )
+-        quantized_body = context.builder.temporary_buffer(
+-            size_bytes=token_rows * body_width, alignment_bytes=256
+-        )
+-        quantize(
+-            context.builder,
+-            context.kernels,
+-            quantized_body,
+-            body,
+-            ffn_in[3],
+-            QuantizeSpecialization(token_rows, body_width, context.architecture),
++        ffn_in = _carrier(context, prefix, "ffn_in", hidden_width, body_width)
++        quantized_body = _quantized_input(
++            context, body, "ffn_in", ffn_in[3], token_rows, body_width
+         )
+         int8_matmul(
+             context.builder,
+@@ -1525,6 +1602,15 @@ def _ffn(
+             alpha=alpha,
+         )
+     output = _temporary_f16(context, element_count=token_rows * body_width)
++    if "qkv" in _INT8_LAYERS and next_prefix is not None:
++        next_attn_in = _carrier(
++            context, next_prefix, "attn_in", 3 * body_width, body_width
++        )
++        _layer_norm_for_int8(
++            context, output, branch, gammas, betas, next_attn_in[3], "attn_in",
++            token_rows, body_width,
++        )
++        return output
+     layer_norm(
+         context.builder,
+         context.kernels,
