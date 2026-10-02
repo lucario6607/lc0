@@ -1,0 +1,65 @@
+From 8332c01ced6d2732407d0c1f218f3282df9d967e Mon Sep 17 00:00:00 2001
+From: lucario6607 <lucario6607@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 09:03:51 -0500
+Subject: [PATCH 6/8] LC0EX_INT8_LAYERS: choose which carrier layers run in
+ int8
+
+---
+ .../lczero-triton/src/lczero_triton/bt4/network.py  | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/packages/lczero-triton/src/lczero_triton/bt4/network.py b/packages/lczero-triton/src/lczero_triton/bt4/network.py
+index 9ea4748..ee1a50b 100644
+--- a/packages/lczero-triton/src/lczero_triton/bt4/network.py
++++ b/packages/lczero-triton/src/lczero_triton/bt4/network.py
+@@ -82,6 +82,10 @@ _CUTLASS_OUTPROJ = os.environ.get("LC0EX_CUTLASS_OUTPROJ") == "1"
+ _CUTLASS_QKV = os.environ.get("LC0EX_CUTLASS_QKV") == "1"
+ # Use the int8 encoder weights a carrier net ships (QKV, out-projection, FFN1).
+ _INT8 = os.environ.get("LC0EX_INT8") == "1"
++# Which carrier layers to run in int8 (default all): qkv, out, ffn1.
++_INT8_LAYERS = frozenset(
++    os.environ.get("LC0EX_INT8_LAYERS", "qkv,out,ffn1").split(",")
++) if _INT8 else frozenset()
+ 
+ # Chunked attention segment (round 14 item A.2).  `LC0EX_SEGMENT_CHUNK` is the
+ # chunk size in SAMPLES; 0 or unset leaves the segment whole and this file emits
+@@ -1032,10 +1036,11 @@ def _attention(  # noqa: PLR0913
+         name=f"{prefix}/mha/out/dense/b/w",
+         path=f"{path}.mha.dense_b",
+     )
+-    if _INT8:
++    if "qkv" in _INT8_LAYERS:
+         attn_in = carrier_layer(
+             context.builder, prefix, "attn_in", 3 * model_width, body_width
+         )
++    if "out" in _INT8_LAYERS:
+         attn_out = carrier_layer(
+             context.builder, prefix, "attn_out", body_width, model_width
+         )
+@@ -1179,7 +1184,7 @@ def _attention(  # noqa: PLR0913
+                     context.architecture,
+                 ),
+             )
+-        if _INT8:
++        if "qkv" in _INT8_LAYERS:
+             quantized_body = context.builder.temporary_buffer(
+                 size_bytes=chunk_rows * body_width, alignment_bytes=256
+             )
+@@ -1253,7 +1258,7 @@ def _attention(  # noqa: PLR0913
+                 has_smolgen=has_smolgen,
+             ),
+         )
+-        if _INT8:
++        if "out" in _INT8_LAYERS:
+             quantized_merged = context.builder.temporary_buffer(
+                 size_bytes=chunk_rows * model_width, alignment_bytes=256
+             )
+@@ -1415,7 +1420,7 @@ def _ffn(
+ 
+     token_rows = context.batch_size * _SQUARE_COUNT
+     hidden = _temporary_f16(context, element_count=token_rows * hidden_width)
+-    if _INT8:
++    if "ffn1" in _INT8_LAYERS:
+         ffn_in = carrier_layer(
+             context.builder, prefix, "ffn_in", hidden_width, body_width
+         )
