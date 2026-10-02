@@ -66,3 +66,39 @@ Core undervolting helps; a system-clock overclock hurt batch 84.
 
 **Best batch: 40** — ties 84 in short runs, slightly ahead sustained, and has none of
 the occasional slow batches batch 84 shows. 42 is ~1.5 % behind 40.
+
+## Int8 carrier nets (`bt4_carrier_R45`) — builder patches 0005-0007
+
+A carrier net is the same BT4 net plus an embedded ONNX model with no graph that
+carries, per encoder, `q1/{attn_in,attn_out,ffn_in}/{w,scale,bias,r}`:
+symmetric int8 weights stored as uint8 bytes in [out, in] order, a per-output
+FP32 `scale`, the FP32 layer `bias` and a per-input FP32 `r`:
+
+    y[o] = scale[o] * sum_i clamp(round(x[i] * r[i]), +-127) * w[o, i] + bias[o]
+
+`attn_in` is the fused QKV, `attn_out` the out-projection (with the residual
+`alpha` folded into its scale and bias), `ffn_in` FFN1. FFN2 has no int8 copy.
+
+`LC0EX_INT8=1` runs those three GEMMs on int8 tensor cores (Triton, int32
+accumulator) and quantizes their inputs inside the LayerNorm / attention kernels
+that produce them. `LC0EX_INT8_LAYERS=qkv,out,ffn1` picks a subset. The FP16
+BT4 kernels are untouched; the existing FP16 artifacts also load carrier nets.
+
+```bash
+LC0EX_INT8=1 LC0EX_CUTLASS_QKV=1 LC0EX_CUTLASS_OUTPROJ=1 LC0EX_CUTLASS_FFN1=1 \
+LC0EX_CUTLASS_FFN2=1 LC0EX_TRITON_PIN=triton-pins-b84.json \
+uv run --package lczero-triton lczero-triton graph --network bt4_carrier_R45.pb.gz \
+    --output bt4_carrier_int8.lc0ex --batch-size 84
+```
+
+Batch 84, 2 threads, cooled GPU, accuracy vs `cuda-fp16` on 2000 positions:
+
+| int8 layers | nps | vs FP16 | policy KL mean | top-1 |
+|---|---:|---:|---:|---:|
+| none (FP16) | 10,240 | | 1.1e-5 | 99.80 % |
+| qkv | 11,865 | +15.9 % | 2.4e-4 | 98.85 % |
+| qkv, ffn1 | 12,654 | +23.6 % | 3.9e-4 | 98.05 % |
+| qkv, out, ffn1 | **13,775** | **+34.5 %** | 6.0e-4 | 97.25 % |
+
+The int8 kernels match the exact int8 arithmetic; the accuracy cost is the net's
+quantization. Best batch for int8 is 84 (batch 40: 13,040, 42: 12,930).
